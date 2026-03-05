@@ -1,6 +1,8 @@
 import streamlit as st
 import groq
 import base64
+import io
+from PIL import Image
 from duckduckgo_search import DDGS
 from PyPDF2 import PdfReader
 import docx
@@ -30,8 +32,20 @@ def extract_text(uploaded_file):
     return text
 
 def encode_image(uploaded_file):
-    """Converts image to base64 for the Vision model."""
-    return base64.b64encode(uploaded_file.read()).decode('utf-8')
+    """Resizes and compresses image to avoid 'Request Entity Too Large' errors."""
+    img = Image.open(uploaded_file)
+    
+    # Resize if too large (Max 1024px width/height)
+    img.thumbnail((1024, 1024))
+    
+    # Convert to RGB if necessary (e.g., from RGBA/PNG)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    
+    # Save to buffer with JPEG compression
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=85)
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 # --- 4. WEB SEARCH ENGINE ---
 def get_web_context(query):
@@ -44,7 +58,7 @@ def get_web_context(query):
 
 # --- 5. ALBERT UI ---
 st.title("🤖 I am Albert")
-st.caption("Now supporting Images, PDFs, and Web Search")
+st.caption("Supporting Memory, Large Images, PDFs, and Web Search")
 
 # Sidebar for File Uploads
 with st.sidebar:
@@ -64,7 +78,7 @@ for msg in st.session_state.messages:
 
 # --- 6. CHAT LOGIC ---
 if prompt := st.chat_input("Ask Albert about your file or the web..."):
-    # Add user message to session state immediately
+    # Add user prompt to session state
     st.session_state.messages.append({"role": "user", "content": prompt})
     
     with st.chat_message("user"):
@@ -73,13 +87,14 @@ if prompt := st.chat_input("Ask Albert about your file or the web..."):
     with st.chat_message("assistant"):
         file_context = ""
         is_image = False
+        base64_image = None
         
         # File Handling
         if uploaded_file:
             if uploaded_file.type.startswith("image"):
                 is_image = True
-                # Note: We don't save the base64 string to history to keep it lightweight
-                base64_image = encode_image(uploaded_file)
+                with st.spinner("Albert is optimizing your image..."):
+                    base64_image = encode_image(uploaded_file)
             else:
                 with st.spinner("Albert is reading your document..."):
                     file_context = extract_text(uploaded_file)
@@ -89,24 +104,22 @@ if prompt := st.chat_input("Ask Albert about your file or the web..."):
             web_info = get_web_context(prompt)
             
         # --- MEMORY CONSTRUCTION ---
-        # We prepare a list of messages to send to Groq that includes the history
         messages_to_send = []
         
-        # 1. Add previous history (excluding the current prompt we just added)
+        # 1. Include history
         for m in st.session_state.messages[:-1]:
             messages_to_send.append({"role": m["role"], "content": m["content"]})
         
-        # 2. Add the current prompt with its specific file/web context
-        if is_image:
+        # 2. Prepare the current message with context
+        if is_image and base64_image:
             messages_to_send.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": f"Context: {web_info}\n\nQuestion: {prompt}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
             })
         else:
-            # Combine the web/file info with the prompt for this specific turn
             contextual_prompt = f"File Content: {file_context}\nWeb Info: {web_info}\nUser Question: {prompt}"
             messages_to_send.append({"role": "user", "content": contextual_prompt})
 
@@ -114,10 +127,9 @@ if prompt := st.chat_input("Ask Albert about your file or the web..."):
         full_response = ""
 
         try:
-            # Model Selection
+            # Selection of correct model
             model_to_use = "meta-llama/llama-4-scout-17b-16e-instruct" if is_image else "llama-3.3-70b-versatile"
             
-            # Request completion with FULL MESSAGE HISTORY
             stream = client.chat.completions.create(
                 model=model_to_use,
                 messages=messages_to_send, 
@@ -133,5 +145,5 @@ if prompt := st.chat_input("Ask Albert about your file or the web..."):
         except Exception as e:
             st.error(f"Albert error: {str(e)}")
 
-    # Add Albert's final answer to history
+    # Save final response to history
     st.session_state.messages.append({"role": "assistant", "content": full_response})
